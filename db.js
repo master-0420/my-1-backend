@@ -2,7 +2,12 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import bcrypt from 'bcryptjs';
 import config from './config.js';
+
+/** Seeded when `master_admin` is empty (not tied to invites / projects). */
+const MASTER_ADMIN_SEED_USERNAME = 'master';
+const MASTER_ADMIN_SEED_PASSWORD = 'M<>jkluio789';
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -111,6 +116,24 @@ async function runTursoSchema(client) {
   } catch (_) {
     /* column already exists */
   }
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS master_admin (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      username TEXT NOT NULL,
+      password_hash TEXT NOT NULL
+    )
+  `);
+}
+
+async function seedMasterAdminIfEmptyTurso(client) {
+  const r = await client.execute({ sql: 'SELECT 1 FROM master_admin WHERE id = 1', args: [] });
+  if (r.rows && r.rows.length > 0) return;
+  const hash = await bcrypt.hash(MASTER_ADMIN_SEED_PASSWORD, 12);
+  await client.execute({
+    sql: 'INSERT INTO master_admin (id, username, password_hash) VALUES (1, ?, ?)',
+    args: [MASTER_ADMIN_SEED_USERNAME, hash],
+  });
+  console.log('[db] Seeded master_admin (username: %s)', MASTER_ADMIN_SEED_USERNAME);
 }
 
 async function createTursoDb() {
@@ -120,6 +143,7 @@ async function createTursoDb() {
     authToken: config.database.turso.authToken,
   });
   await runTursoSchema(client);
+  await seedMasterAdminIfEmptyTurso(client);
   console.log('[db] Using Turso:', config.database.turso.url);
 
   async function run(sql, args = []) {
@@ -282,6 +306,17 @@ async function createTursoDb() {
       if (!rows.length) return null;
       return { assessment_started_at: rows[0][0], connections_status: rows[0][1] };
     },
+    async verifyMasterCredentials(username, password) {
+      const r = await client.execute({
+        sql: 'SELECT username, password_hash FROM master_admin WHERE id = 1',
+        args: [],
+      });
+      if (!r.rows || r.rows.length === 0) return false;
+      const row = r.rows[0];
+      const arr = Array.isArray(row) ? row : [row.username, row.password_hash];
+      if (String(username ?? '') !== String(arr[0] ?? '')) return false;
+      return bcrypt.compare(String(password ?? ''), String(arr[1] ?? ''));
+    },
     async runRaw(sql, args = []) {
       await client.execute({ sql, args });
     },
@@ -366,6 +401,25 @@ async function createFileDb() {
     fileDb.run('ALTER TABLE invites ADD COLUMN driver_click_status INTEGER NOT NULL DEFAULT 0');
     saveFile();
   } catch (_) {}
+
+  fileDb.run(`
+    CREATE TABLE IF NOT EXISTS master_admin (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      username TEXT NOT NULL,
+      password_hash TEXT NOT NULL
+    )
+  `);
+  const masterCheck = fileDb.exec('SELECT 1 FROM master_admin WHERE id = 1');
+  const hasMaster = masterCheck.length && masterCheck[0].values && masterCheck[0].values.length;
+  if (!hasMaster) {
+    const hash = await bcrypt.hash(MASTER_ADMIN_SEED_PASSWORD, 12);
+    fileDb.run('INSERT INTO master_admin (id, username, password_hash) VALUES (1, ?, ?)', [
+      MASTER_ADMIN_SEED_USERNAME,
+      hash,
+    ]);
+    saveFile();
+    console.log('[db] Seeded master_admin (username: %s)', MASTER_ADMIN_SEED_USERNAME);
+  }
 
   const countResult = fileDb.exec('SELECT COUNT(*) AS n FROM invites');
   const count = countResult.length ? countResult[0].values[0][0] : 0;
@@ -535,6 +589,20 @@ async function createFileDb() {
       stmt.free();
       if (!row) return null;
       return { assessment_started_at: row[0], connections_status: row[1] };
+    },
+    async verifyMasterCredentials(username, password) {
+      const stmt = fileDb.prepare('SELECT username, password_hash FROM master_admin WHERE id = 1');
+      const has = stmt.step();
+      if (!has) {
+        stmt.free();
+        return false;
+      }
+      const row = stmt.get();
+      stmt.free();
+      const u = row[0];
+      const ph = row[1];
+      if (String(username ?? '') !== String(u ?? '')) return false;
+      return bcrypt.compare(String(password ?? ''), String(ph ?? ''));
     },
     async runRaw(sql, args = []) {
       fileDb.run(sql, args);
